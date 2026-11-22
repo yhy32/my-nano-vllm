@@ -7,10 +7,15 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+MODEL_CLASSES = {
+    "qwen3": Qwen3ForCausalLM,
+    "qwen3_moe": Qwen3MoeForCausalLM,
+}
 
 class ModelRunner:
 
@@ -22,14 +27,17 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
+        model_cls = MODEL_CLASSES.get(hf_config.model_type)
+        if model_cls is None:
+            supported = ", ".join(MODEL_CLASSES)
+            raise ValueError(f"Unsupported model_type {hf_config.model_type!r}. Supported: {supported}")
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.model = model_cls(hf_config)
+        load_model(self.model, config.model, model_type=hf_config.model_type)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

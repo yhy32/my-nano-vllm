@@ -9,7 +9,15 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def load_model(model: nn.Module, path: str):
+WEIGHT_SUFFIX_MAPPINGS = {
+    "qwen3_moe": {
+        ".mlp.gate.weight": ".mlp.topkRouter.router.weight",
+    },
+}
+
+
+def load_model(model: nn.Module, path: str, *, model_type: str | None = None):
+    suffix_mapping = WEIGHT_SUFFIX_MAPPINGS.get(model_type, {})
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
@@ -23,6 +31,11 @@ def load_model(model: nn.Module, path: str):
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break
                 else:
-                    param = model.get_parameter(weight_name)
+                    param_name = weight_name
+                    for suffix, replacement in suffix_mapping.items():
+                        if weight_name.endswith(suffix):
+                            param_name = weight_name.removesuffix(suffix) + replacement
+                            break
+                    param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
