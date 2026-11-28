@@ -3,6 +3,7 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3MoeConfig
 
+from nanovllm.layers.moe import expert_parallel_forward
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
@@ -117,18 +118,18 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeExperts(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, *, local: bool = False):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
-            bias=False,
+            bias=False, local=local,
         )
         self.act_fn = SiluAndMul()
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
-            bias=False,
+            bias=False, local=local,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -176,9 +177,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_experts: int = 128,
         num_experts_per_tok: int = 8,
         norm_topk_prob: bool = True,
+        expert_parallel: bool = False,
     ):
         super().__init__()
         self.topkRouter = Qwen3MoeTopKRouter(num_experts_per_tok=num_experts_per_tok, num_experts=num_experts, norm_topk_prob=norm_topk_prob, hidden_size=hidden_size)
+        self.expert_parallel = expert_parallel
+        if expert_parallel:
+            world = dist.get_world_size()
+            if num_experts % world:
+                raise ValueError("Unequal expert partitions are unsupported")
+            self.local_count = num_experts // world
+            self.first_expert = dist.get_rank() * self.local_count
+            self.experts = nn.ModuleDict({
+                str(i): Qwen3MoeExperts(hidden_size, intermediate_size, local=True)
+                for i in range(self.first_expert, self.first_expert + self.local_count)
+            })
+            return
         self.experts = nn.ModuleList([
             Qwen3MoeExperts(hidden_size, intermediate_size)
             for _ in range(num_experts)
@@ -186,6 +200,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: [T, H]，T = B * L
+        if self.expert_parallel:
+            return expert_parallel_forward(hidden_states, self.topkRouter, self.experts,
+                                           self.first_expert, self.local_count)
         _, router_scores, router_indices = self.topkRouter(hidden_states)
 
         output = torch.zeros_like(hidden_states)
@@ -209,7 +226,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeConfig,
-        layer_idx: int
+        layer_idx: int, expert_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3MoeAttetion(
@@ -231,6 +248,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                             intermediate_size=config.moe_intermediate_size,
                             num_experts=config.num_experts,
                             num_experts_per_tok=config.num_experts_per_tok,
+                            expert_parallel=expert_parallel,
                             norm_topk_prob=config.norm_topk_prob
                         )
         else:
@@ -262,11 +280,11 @@ class Qwen3MoeModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3MoeConfig,
+        config: Qwen3MoeConfig, expert_parallel: bool = False,
     ):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config, layer_idx, expert_parallel) for layer_idx in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -289,13 +307,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    weight_suffix_mapping = {
+        ".mlp.gate.weight": ".mlp.topkRouter.router.weight",
+    }
 
     def __init__(
         self,
-        config: Qwen3MoeConfig
+        config: Qwen3MoeConfig, expert_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.model = Qwen3MoeModel(config)
+        self.model = Qwen3MoeModel(config, expert_parallel)
+        self.local_expert_ids = None
+        if expert_parallel:
+            count = config.num_experts // dist.get_world_size()
+            start = dist.get_rank() * count
+            self.local_expert_ids = range(start, start + count)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

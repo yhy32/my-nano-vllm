@@ -11,6 +11,7 @@ from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.fp8 import FP8Config
 
 MODEL_CLASSES = {
     "qwen3": Qwen3ForCausalLM,
@@ -36,8 +37,30 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = model_cls(hf_config)
-        load_model(self.model, config.model, model_type=hf_config.model_type)
+        model_kwargs = {"expert_parallel": True} if config.enable_expert_parallel else {}
+        self.model = model_cls(hf_config, **model_kwargs)
+        self.fp8Config = FP8Config(hf_config)
+        load_model(self.model, config.model, model_type=hf_config.model_type, fp8Config=self.fp8Config)
+        # 权重和 scale 加载完成后、warmup 开始前，给支持的线性层挂上 CUDA 接口。
+        if (hf_config.model_type == "qwen3" and self.fp8Config.is_FP8
+                and self.world_size == 1 and self.enforce_eager):
+            from my_custom_op.setup import build_extension
+            from nanovllm.layers.linear import LinearBase
+
+            # 当前接入覆盖单卡 eager 的 dense Qwen3，所有兼容的 FP8 Linear 共用同一个函数。
+            if self.fp8Config.weight_block_size == (128, 128):
+                fp8_layers = [
+                    layer for layer in self.model.modules()
+                    if isinstance(layer, LinearBase)
+                    and layer.weight.dtype == torch.float8_e4m3fn
+                    and layer.scale_inv is not None
+                    and layer.scale_inv.dtype == torch.bfloat16
+                ]
+                if fp8_layers:
+                    # 扩展在初始化时加载一次，forward 只调用已经绑定好的函数。
+                    dequant_kernel = build_extension().dequant_fp8
+                    for layer in fp8_layers:
+                        layer.dequant_kernel = dequant_kernel
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -119,6 +142,11 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if config.enable_expert_parallel and self.world_size > 1:
+            # Routing can give ranks different warmup peaks. Block IDs are shared.
+            capacity = torch.tensor(config.num_kvcache_blocks, device="cuda")
+            dist.all_reduce(capacity, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = capacity.item()
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
